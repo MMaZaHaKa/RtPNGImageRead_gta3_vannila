@@ -2,8 +2,16 @@
 // by MaZaHaKa and AAP
 #include "RenderWare.h"
 #include "lodepng/lodepng.h" // https://github.com/aap/librw/tree/master/src/lodepng
+//#include <jpeglib.h> //  vcpkg install libjpeg-turbo
+#include <iostream>
 #include <fstream>
 #define null NULL
+
+// stb https://github.com/nothings/stb/tree/master
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb/stb_image.h"
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include "stb/stb_image_resize2.h"
 
 uint8_t* getFileContents(const char* name, uint32_t* len)
 {
@@ -20,9 +28,122 @@ uint8_t* getFileContents(const char* name, uint32_t* len)
 	return buffer;
 }
 
+RwImage* testRtJPGImageRead(const char* filename)
+{
+	int ch = 4;
+	int depth = ch * 8; // Глубина цвета: 8 бит на канал.
+	RwImage* image = RwImageCreate(16, 16, depth);
+	RwImageAllocatePixels(image);
+	for (size_t i = 0; i < 16 * 16 * ch; i+= ch)
+	{
+		image->cpPixels[i] = 0;
+		image->cpPixels[i+1] = 255;
+		image->cpPixels[i+2] = 0;
+		image->cpPixels[i+3] = 255; // alpha
+	}
+	return image;
+}
+
+RwImage* RtSTBIImageRead(const char* filename, CRGBA* pBg = null, int32_t limw = -1, int32_t limh = -1) // tesed: bmp,gif,png,jpg,png(index),tga,jpeg
+{
+	int width, height, channels;
+
+	uint8_t* raw = stbi_load(filename, &width, &height, &channels, 0);
+	if (!raw) { return null; }
+	//std::cout << "f: " << filename << " width: " << width << " height: " << height << " channels: " << channels << "\n";
+	if (!((channels == 3) || (channels == 4))) { return null; } // not 888/8888, todo LCT_PALETTE
+	int depth = channels * 8; // channels 3,4
+	bool is_888 = (channels == 3); // RGB
+
+	if (limw > 0 && limh > 0 && (limw != width || limh != height)) {
+		uint8_t* resized_raw = (uint8_t*)malloc(limw * limh * channels);
+		if (!resized_raw) {
+			stbi_image_free(raw);
+			return nullptr;
+		}
+
+		stbir_resize(raw, width, height, width * channels, // input_stride_in_bytes
+			resized_raw, limw, limh, limw * channels, // output_stride_in_bytes
+			STBIR_RGB, STBIR_TYPE_UINT8,               // 3-канальный RGB макет, 8-битный тип данных
+			STBIR_EDGE_CLAMP, STBIR_FILTER_DEFAULT);
+
+		stbi_image_free(raw);
+		raw = resized_raw;
+		width = limw;
+		height = limh;
+	}
+
+	RwImage* image = RwImageCreate(width, height, 8 * 4); // todo 888 not work in gta 3, use 32 with alpha 255
+	// lock ??
+	if (!image) { stbi_image_free(raw); return null; }
+	RwImageAllocatePixels(image);
+
+	if (is_888) // RwImage with 888 not work, todo flags, default RwImage 8888
+	{
+		for (size_t p = 0; p < width * height; ++p)
+		{
+			image->cpPixels[p * 4 + 0] = raw[p * 3 + 0];  // R
+			image->cpPixels[p * 4 + 1] = raw[p * 3 + 1];  // G
+			image->cpPixels[p * 4 + 2] = raw[p * 3 + 2];  // B
+			image->cpPixels[p * 4 + 3] = 255;  // A
+			//image->cpPixels[p * 4 + 3] = (alpha > -1 && alpha < 256) ? alpha : 255;  // A
+		}
+	}
+	else // 8888
+	{
+		if(!pBg) { memcpy(image->cpPixels, raw, width * height * channels); }
+		else
+		{
+			for (size_t p = 0; p < width * height; ++p)
+			{
+				uint8_t r = raw[p * 4 + 0];
+				uint8_t g = raw[p * 4 + 1];
+				uint8_t b = raw[p * 4 + 2];
+				uint8_t a = raw[p * 4 + 3];
+
+				// Если альфа < 255, смешиваем с фоновым цветом.
+				if (a < 255)
+				{
+					// Применяем альфа-смешивание (альфа-композитинг).
+					r = (uint8_t)((r * a + pBg->r * (255 - a)) / 255);
+					g = (uint8_t)((g * a + pBg->g * (255 - a)) / 255);
+					b = (uint8_t)((b * a + pBg->b * (255 - a)) / 255);
+					a = 255;  // Устанавливаем полную непрозрачность после смешивания.
+				}
+
+				image->cpPixels[p * 4 + 0] = r;
+				image->cpPixels[p * 4 + 1] = g;
+				image->cpPixels[p * 4 + 2] = b;
+				image->cpPixels[p * 4 + 3] = a;
+			}
+		}
+	}
+
+	stbi_image_free(raw);
+	return image;
+}
+
+RwTexture* LoadTextureFromImageFileBySTBI(const char* filename, const char* tex_name = null, CRGBA* pBg = null, int32_t limw = -1, int32_t limh = -1) // or check CPlayerSkin::GetSkinTexture
+{
+	RwImage* image = RtSTBIImageRead(filename, pBg, limw, limh);
+	if (!image) { printf("ERROR!!!!\n"); return null; }
+	RwInt32 width, height, depth, flags;
+	RwImageFindRasterFormat(image, 4, &width, &height, &depth, &flags);
+	RwRaster* raster = RwRasterCreate(width, height, depth, flags);
+	RwRasterSetFromImage(raster, image);
+	RwTexture* myTexture = RwTextureCreate(raster);
+	if (tex_name) { RwTextureSetName(myTexture, tex_name); }
+	RwImageDestroy(image);
+	return myTexture;
+};
+
+
+
+//---------lodepng
+
 void expandPal4_BE(uint8_t* dst, uint32_t dststride, uint8_t* src, uint32_t srcstride, int32_t w, int32_t h);
 
-RwImage* RtRwImageReadPNG(const char* filename)
+RwImage* RtPNGImageRead(const char* filename)
 {
 	RwImage* image = null;
 	uint32_t length;
@@ -101,8 +222,8 @@ RwImage* RtRwImageReadPNG(const char* filename)
 
 RwTexture* LoadTextureFromPNGFile(const char* filename, const char* tex_name = null) // or check CPlayerSkin::GetSkinTexture
 {
-	RwImage* image = RtRwImageReadPNG(filename);
-	if (!image) { return null; }
+	RwImage* image = RtPNGImageRead(filename);
+	if (!image) { std::cout << "ERROR!!!!" << "\n"; return null; }
 	RwInt32 width, height, depth, flags;
 	RwImageFindRasterFormat(image, 4, &width, &height, &depth, &flags);
 	RwRaster* raster = RwRasterCreate(width, height, depth, flags);
@@ -112,7 +233,6 @@ RwTexture* LoadTextureFromPNGFile(const char* filename, const char* tex_name = n
 	RwImageDestroy(image);
 	return myTexture;
 };
-
 
 
 
@@ -145,7 +265,7 @@ RwTexture* CopyTexture(RwTexture* pTex) // mb use RwImageCopy
 		RwUInt8* srcPixels = pTex->raster->cpPixels; // srcPixels !null
 
 		RwRaster* newraster = RwRasterCreate(width, height, depth, rwRASTERTYPETEXTURE | (is888 ? rwRASTERFORMAT888 : rwRASTERFORMAT8888));
-		RwUInt8* dstPixels = (RwUInt8*)RwRasterLock(newraster, 0, rwRASTERLOCKREADWRITE); // raster lock 4 modify
+		RwUInt8* dstPixels = RwRasterLock(newraster, 0, rwRASTERLOCKREADWRITE); // raster lock 4 modify
 		//RwUInt8* dstPixels = newraster->cpPixels; // srcPixels be null
 
 		//newraster->cpPixels = (RwUInt8*)malloc(newWidth * newHeight * (depth / 8));
@@ -237,7 +357,7 @@ RwTexture* LimitHeightWidthTexture(RwTexture* pTex, int maxW = 512, int maxH = 5
 		RwRaster* newraster = RwRasterCreate(newWidth, newHeight, depth, rwRASTERTYPETEXTURE | (is888 ? rwRASTERFORMAT888 : rwRASTERFORMAT8888));
 		//RwUInt8* srcPixels = (RwUInt8*)RwRasterLock(pTex->raster, 0, rwRASTERLOCKREAD); // srcPixels null
 		RwUInt8* srcPixels = pTex->raster->cpPixels; // srcPixels !null
-		RwUInt8* dstPixels = (RwUInt8*)RwRasterLock(newraster, 0, rwRASTERLOCKREADWRITE); // need for new RwRasterCreate
+		RwUInt8* dstPixels = RwRasterLock(newraster, 0, rwRASTERLOCKREADWRITE); // need for new RwRasterCreate
 
 		//newraster->cpPixels = (RwUInt8*)malloc(newWidth * newHeight * (depth / 8));
 		// алгоритм масштабирования (билинейное уменьшение)
